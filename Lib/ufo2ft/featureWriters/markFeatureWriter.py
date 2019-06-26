@@ -4,6 +4,7 @@ from collections import OrderedDict
 from functools import partial
 import itertools
 from fontTools.misc.py23 import tostr, tounicode
+from fontTools.misc.classifyTools import Classifier
 from fontTools.misc.fixedTools import otRound
 from ufo2ft.featureWriters import BaseFeatureWriter, ast
 from ufo2ft.util import unicodeInScripts, classifyGlyphs
@@ -236,12 +237,6 @@ class MarkFeatureWriter(BaseFeatureWriter):
         "Telu",  # Telugu
     }
 
-    # Glyphs moves "_bottom" and "_top" (if present) to the top of
-    # the list and then picks the first to use in the mark feature.
-    # https://github.com/googlei18n/noto-source/issues/122
-    # #issuecomment-403952188
-    anchorSortKey = {"_bottom": -2, "_top": -1}
-
     def setContext(self, font, feaFile, compiler=None):
         ctx = super(MarkFeatureWriter, self).setContext(
             font, feaFile, compiler=compiler
@@ -312,9 +307,6 @@ class MarkFeatureWriter(BaseFeatureWriter):
                 del self.context.anchorLists[glyphName]
 
     def _groupMarkGlyphsByAnchor(self):
-        def sort_key(a):
-            return self.anchorSortKey.get(a.name, 0)
-
         gdefMarks = self.context.gdefClasses.mark
         markAnchorNames = set(self.context.anchorPairs.values())
         markGlyphNames = set()
@@ -328,13 +320,10 @@ class MarkFeatureWriter(BaseFeatureWriter):
             markAnchors = [a for a in anchors if a.name in markAnchorNames]
             if not markAnchors:
                 continue
-            # only use the first mark anchor, using a predefined sorting, to
-            # determine which markClass a mark glyph belongs. This is to avoid
-            # overlapping mark classes within the same lookup
-            anchor = sorted(markAnchors, key=sort_key)[0]
-            group = groups.setdefault(anchor.name, OrderedDict())
-            assert glyphName not in group
-            group[glyphName] = anchor
+            for anchor in markAnchors:
+                group = groups.setdefault(anchor.name, OrderedDict())
+                assert glyphName not in group
+                group[glyphName] = anchor
             markGlyphNames.add(glyphName)
         self.context.markGlyphNames = markGlyphNames
         return groups
@@ -405,24 +394,37 @@ class MarkFeatureWriter(BaseFeatureWriter):
         markGlyphNames = self.context.markGlyphNames
         baseClass = self.context.gdefClasses.base
         result = []
-        for glyphName, anchors in self.context.anchorLists.items():
-            # exclude mark glyphs, or glyphs not listed in GDEF Base
-            if glyphName in markGlyphNames or (
-                baseClass is not None and glyphName not in baseClass
-            ):
-                continue
-            baseMarks = []
-            for anchor in anchors:
-                if anchor.markClass is None or anchor.number is not None:
-                    # skip anchors for which no mark class is defined; also
-                    # skip '_1', '_2', etc. suffixed anchors for this lookup
-                    # type; these will be are added in the mark2liga lookup
+
+        disjointMarkGroups = self._getDisjointMarkClassGroups()
+
+        for markClasses in disjointMarkGroups:
+            subtable = []
+            for glyphName, anchors in self.context.anchorLists.items():
+                # exclude mark glyphs, or glyphs not listed in GDEF Base
+                if glyphName in markGlyphNames or (
+                    baseClass is not None and glyphName not in baseClass
+                ):
                     continue
-                assert not anchor.isMark
-                baseMarks.append(anchor)
-            if not baseMarks:
-                continue
-            result.append(MarkToBasePos(glyphName, baseMarks))
+                # skip anchors for which no mark class is defined; also
+                # skip '_1', '_2', etc. suffixed anchors for this lookup
+                # type; these will be are added in the mark2liga lookup
+                baseAnchors = sorted(
+                    (
+                        a
+                        for a in anchors
+                        if a.markClass is not None and a.number is None
+                    ),
+                    key=lambda a: a.name
+                )
+                baseMarks = []
+                for anchor in baseAnchors:
+                    assert not anchor.isMark
+                    if anchor.markClass.name in markClasses:
+                        baseMarks.append(anchor)
+                if baseMarks:
+                    subtable.append(MarkToBasePos(glyphName, baseMarks))
+            if subtable:
+                result.append(subtable)
         return result
 
     def _makeMarkToMarkAttachments(self):
@@ -538,17 +540,20 @@ class MarkFeatureWriter(BaseFeatureWriter):
         return lkp
 
     def _makeMarkFeature(self, include):
-        baseLkp = self._makeMarkLookup(
-            "mark2base", self.context.markToBaseAttachments, include
-        )
+        baseLookups = []
+        for i, markAttachments in enumerate(self.context.markToBaseAttachments):
+            baseLkp = self._makeMarkLookup(
+                "mark2base_%d" % i, markAttachments, include
+            )
+            baseLookups.append(baseLkp)
         ligaLkp = self._makeMarkLookup(
             "mark2liga", self.context.markToLigaAttachments, include
         )
-        if baseLkp is None and ligaLkp is None:
+        if baseLookups is None and ligaLkp is None:
             return
 
         feature = ast.FeatureBlock("mark")
-        if baseLkp:
+        for baseLkp in baseLookups:
             feature.statements.append(baseLkp)
         if ligaLkp:
             feature.statements.append(ligaLkp)
@@ -680,6 +685,15 @@ class MarkFeatureWriter(BaseFeatureWriter):
             return glyphGroups.get(True, set())
         else:
             return set()
+
+    def _getDisjointMarkClassGroups(self):
+        classesByGlyph = {}
+        for markClass in self.context.markClasses.values():
+            for glyphName in markClass.glyphs:
+                classesByGlyph.setdefault(glyphName, set()).add(markClass.name)
+        classifier = Classifier(sort=True)
+        classifier.update(classesByGlyph.values())
+        return classifier.getClasses()
 
     def _write(self):
         self._pruneUnusedAnchors()
